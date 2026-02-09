@@ -1,184 +1,134 @@
 #!/bin/bash
 
-# =========================
-# Ultimate Recon Pipeline
-# =========================
-
 set -e
 
-# -------- Colors --------
 GREEN="\e[32m"
 YELLOW="\e[33m"
 RED="\e[31m"
 RESET="\e[0m"
 
-# -------- Go Path --------
 export GOPATH="$HOME/go"
 export PATH="$PATH:$GOPATH/bin:/usr/local/bin"
 
-# -------- Banner --------
 clear
-echo -e "${GREEN}"
-cat << "EOF"
- _____     _                 _         _    _____                    _____ _         _ _         
-|  _  |_ _| |_ ___ _____ ___| |_ ___ _| |  | __  |___ ___ ___ ___   |  _  |_|___ ___| |_|___ ___ 
-|     | | |  _| . |     | .'|  _| -_| . |  |    -| -_|  _| . |   |  |   __| | . | -_| | |   | -_|
-|__|__|___|_| |___|_|_|_|__,|_| |___|___|  |__|__|___|___|___|_|_|  |__|  |_|  _|___|_|_|_|_|___|
-                                                                            |_|                  
-EOF
-echo -e "${RESET}"
+echo -e "${GREEN}Ultimate Recon Pipeline${RESET}"
 echo
 
-# -------- Privilege helper --------
-if [[ $EUID -ne 0 ]]; then
-  SUDO="sudo"
-else
-  SUDO=""
-fi
+if [[ $EUID -ne 0 ]]; then SUDO="sudo"; else SUDO=""; fi
 
-# -------- Helpers --------
-check_tool() { command -v "$1" >/dev/null 2>&1; }
-install_apt() {
-  echo -e "${YELLOW}[+] Installing $1${RESET}"
-  $SUDO apt install -y "$1" >/dev/null 2>&1
-}
-install_go() {
-  echo -e "${YELLOW}[+] Installing $1${RESET}"
-  go install "$2"@latest
-}
+check_tool(){ command -v "$1" >/dev/null 2>&1; }
+install_apt(){ echo "[+] Installing $1"; $SUDO apt install -y "$1" >/dev/null 2>&1; }
+install_go(){ echo "[+] Installing $1"; go install "$2"@latest; }
 
-# -------- Tool Check --------
-echo -e "${GREEN}[*] Checking tools...${RESET}"
+echo "[*] Checking tools..."
 $SUDO apt update -qq >/dev/null 2>&1
 
 APT_TOOLS=(git python3 dirsearch)
 for tool in "${APT_TOOLS[@]}"; do
-  if check_tool "$tool"; then
-    echo -e "${GREEN}[✔] $tool found${RESET}"
-  else
-    install_apt "$tool"
-  fi
+  check_tool "$tool" && echo "[✔] $tool found" || install_apt "$tool"
 done
 
 check_tool go || install_apt golang
 
 GO_TOOLS=(
-  "subfinder github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
-  "httpx github.com/projectdiscovery/httpx/cmd/httpx"
-  "katana github.com/projectdiscovery/katana/cmd/katana"
-  "nuclei github.com/projectdiscovery/nuclei/v2/cmd/nuclei"
-  "gf github.com/tomnomnom/gf"
-  "waybackurls github.com/tomnomnom/waybackurls"
+"subfinder github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
+"httpx github.com/projectdiscovery/httpx/cmd/httpx"
+"katana github.com/projectdiscovery/katana/cmd/katana"
+"nuclei github.com/projectdiscovery/nuclei/v2/cmd/nuclei"
+"gf github.com/tomnomnom/gf"
+"waybackurls github.com/tomnomnom/waybackurls"
 )
 
 for entry in "${GO_TOOLS[@]}"; do
   NAME=$(echo "$entry" | awk '{print $1}')
   PKG=$(echo "$entry" | awk '{print $2}')
-  if check_tool "$NAME"; then
-    echo -e "${GREEN}[✔] $NAME found${RESET}"
-  else
-    install_go "$NAME" "$PKG"
-  fi
+  check_tool "$NAME" && echo "[✔] $NAME found" || install_go "$NAME" "$PKG"
 done
 
-# -------- GF Patterns --------
-if [[ ! -d "$HOME/.gf" ]]; then
-  echo -e "${YELLOW}[+] Installing gf patterns${RESET}"
-  git clone https://github.com/1ndianl33t/Gf-Patterns "$HOME/.gf" >/dev/null 2>&1
-  echo 'export GF_PATTERNS_PATH=$HOME/.gf' >> "$HOME/.bashrc"
-fi
-
-# =========================
-# Target Input
-# =========================
-echo
-echo -e "${GREEN}-------------- TARGET INPUT --------------${RESET}"
-echo
-
-read -p " Enter target domain: " DOMAIN
-[[ -z "$DOMAIN" ]] && echo -e "${RED}[!] No domain provided${RESET}" && exit 1
+# GF patterns
+[[ ! -d "$HOME/.gf" ]] && git clone https://github.com/1ndianl33t/Gf-Patterns "$HOME/.gf" >/dev/null 2>&1
 
 echo
-echo " 1) Run full subdomain enumeration"
-echo " 2) Use existing live subdomains file"
+echo "-------------- TARGET INPUT --------------"
+read -p "Enter target domain: " DOMAIN
+
 echo
-read -p " Choose option (1 or 2): " MODE
+echo "1) Full Recon (Everything)"
+echo "2) Provide Live Subdomains File"
+echo "3) Provide Live Subdomains + JS File"
 echo
+read -p "Choose option: " MODE
 
 WORKDIR="$DOMAIN-recon"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
-# -------- Mode 1: Auto Enum --------
+# =========================
+# MODE 1 — FULL RECON
+# =========================
 if [[ "$MODE" == "1" ]]; then
   echo "[+] Running subfinder..."
   subfinder -d "$DOMAIN" -silent -o subdomains.txt
 
   echo "[+] Checking live subdomains..."
   httpx -silent -l subdomains.txt > subdomains_alive.txt
+
+  echo "[+] Finding JS files..."
+  katana -list subdomains_alive.txt -jc -silent | grep "\.js$" | sort -u > js.txt
 fi
 
-# -------- Mode 2: Manual File --------
+# =========================
+# MODE 2 — LIVE FILE INPUT
+# =========================
 if [[ "$MODE" == "2" ]]; then
-  read -p " Enter path to live subdomains file: " LIVEFILE
-  if [[ ! -f "$LIVEFILE" ]]; then
-    echo -e "${RED}[!] File not found${RESET}"
-    exit 1
-  fi
+  read -p "Path to LIVE subdomains file: " LIVEFILE
   cp "$LIVEFILE" subdomains_alive.txt
+
+  echo "[+] Finding JS files..."
+  katana -list subdomains_alive.txt -jc -silent | grep "\.js$" | sort -u > js.txt
+fi
+
+# =========================
+# MODE 3 — LIVE + JS INPUT
+# =========================
+if [[ "$MODE" == "3" ]]; then
+  read -p "Path to LIVE subdomains file: " LIVEFILE
+  read -p "Path to JS file: " JSFILE
+  cp "$LIVEFILE" subdomains_alive.txt
+  cp "$JSFILE" js.txt
 fi
 
 echo
-echo "[+] Live subdomains loaded:"
+echo "[+] Live subdomains:"
 wc -l subdomains_alive.txt
-echo
-
-# =========================
-# JavaScript Discovery
-# =========================
-echo "[+] Discovering JavaScript files..."
-katana -list subdomains_alive.txt -jc -silent | grep "\.js$" | sort -u > js.txt
+echo "[+] JS files:"
 wc -l js.txt
 echo
 
 # =========================
-# URL Collection
+# URL COLLECTION (FIXED)
 # =========================
-echo "[+] Crawling URLs..."
-katana -list subdomains_alive.txt -d 5 \
-  -ps -pss waybackarchive,commoncrawl,alienvault \
-  -hf -jc -fx \
-  -ef woff,css,png,svg,jpg,woff2,jpeg,gif \
-  -o allurls.txt
-
+echo "[+] Crawling URLs (katana updated flags)..."
+katana -list subdomains_alive.txt -d 5 -silent > allurls.txt
 wc -l allurls.txt
-echo
 
-# =========================
-# Processing
-# =========================
+# Parameters & Sensitive files
 grep "=" allurls.txt | sort -u > params.txt
+grep -E '\.txt|\.log|\.db|\.backup|\.json|\.zip|\.config' allurls.txt > sensitive_files.txt
 
-grep -E '\.txt|\.log|\.cache|\.secret|\.db|\.backup|\.yml|\.json|\.gz|\.rar|\.zip|\.config' \
-  allurls.txt > sensitive_files.txt
-
+# GF patterns
 gf xss params.txt > xss_candidates.txt
 gf lfi allurls.txt > lfi_candidates.txt
 
 # =========================
-# Nuclei Scans
+# NUCLEI
 # =========================
-echo "[+] Running Nuclei scans..."
+echo "[+] Running nuclei..."
 nuclei -l js.txt -severity critical,high,medium -o nuclei_js.txt
 cat lfi_candidates.txt | nuclei -tags lfi -o nuclei_lfi.txt
 
-# =========================
-# Wayback XSS
-# =========================
 waybackurls "https://$DOMAIN" | gf xss > wayback_xss.txt
 
 echo
-echo -e "${GREEN}==============================${RESET}"
-echo -e "${GREEN}[✔] Recon completed successfully${RESET}"
-echo -e "${GREEN}[+] Results saved in: $WORKDIR${RESET}"
-echo -e "${GREEN}==============================${RESET}"
+echo "Recon completed!"
+echo "Results saved in $WORKDIR"
