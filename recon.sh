@@ -2,133 +2,124 @@
 
 set -e
 
-GREEN="\e[32m"
-YELLOW="\e[33m"
-RED="\e[31m"
-RESET="\e[0m"
+# ---------------- CONFIG ----------------
+DOMAIN=$1
+DATE=$(date +"%Y-%m-%d_%H%M%S")
+OUTDIR="./recon_${DOMAIN}_${DATE}"
+LOG="$OUTDIR/recon.log"
 
-export GOPATH="$HOME/go"
-export PATH="$PATH:$GOPATH/bin:/usr/local/bin"
+mkdir -p "$OUTDIR"
+touch "$LOG"
 
-clear
-echo -e "${GREEN}Ultimate Recon Pipeline${RESET}"
-echo
+echo "[*] Starting recon for $DOMAIN" | tee -a "$LOG"
 
-if [[ $EUID -ne 0 ]]; then SUDO="sudo"; else SUDO=""; fi
+# ---------------- CHECK TOOLS ----------------
+TOOLS=(subfinder assetfinder amass httpx gau waybackurls gf nuclei)
 
-check_tool(){ command -v "$1" >/dev/null 2>&1; }
-install_apt(){ echo "[+] Installing $1"; $SUDO apt install -y "$1" >/dev/null 2>&1; }
-install_go(){ echo "[+] Installing $1"; go install "$2"@latest; }
-
-echo "[*] Checking tools..."
-$SUDO apt update -qq >/dev/null 2>&1
-
-APT_TOOLS=(git python3 dirsearch)
-for tool in "${APT_TOOLS[@]}"; do
-  check_tool "$tool" && echo "[✔] $tool found" || install_apt "$tool"
+for tool in "${TOOLS[@]}"; do
+    if ! command -v $tool &> /dev/null; then
+        echo "[!] $tool not installed. Please install it first."
+        exit 1
+    fi
 done
 
-check_tool go || install_apt golang
+# ---------------- SUBDOMAIN ENUM ----------------
+echo "[*] Running subdomain enumeration..." | tee -a "$LOG"
 
-GO_TOOLS=(
-"subfinder github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
-"httpx github.com/projectdiscovery/httpx/cmd/httpx"
-"katana github.com/projectdiscovery/katana/cmd/katana"
-"nuclei github.com/projectdiscovery/nuclei/v2/cmd/nuclei"
-"gf github.com/tomnomnom/gf"
-"waybackurls github.com/tomnomnom/waybackurls"
-)
+subfinder -d $DOMAIN -silent > "$OUTDIR/subs_subfinder.txt"
+assetfinder --subs-only $DOMAIN > "$OUTDIR/subs_assetfinder.txt"
+amass enum -passive -d $DOMAIN -o "$OUTDIR/subs_amass.txt"
 
-for entry in "${GO_TOOLS[@]}"; do
-  NAME=$(echo "$entry" | awk '{print $1}')
-  PKG=$(echo "$entry" | awk '{print $2}')
-  check_tool "$NAME" && echo "[✔] $NAME found" || install_go "$NAME" "$PKG"
-done
+cat "$OUTDIR"/subs_*.txt | sort -u > "$OUTDIR/all_subdomains.txt"
+SUB_COUNT=$(wc -l < "$OUTDIR/all_subdomains.txt")
+echo "[+] Found $SUB_COUNT subdomains" | tee -a "$LOG"
 
-# GF patterns
-[[ ! -d "$HOME/.gf" ]] && git clone https://github.com/1ndianl33t/Gf-Patterns "$HOME/.gf" >/dev/null 2>&1
+# ---------------- LIVE HOSTS ----------------
+echo "[*] Probing for live hosts..." | tee -a "$LOG"
 
-echo
-echo "-------------- TARGET INPUT --------------"
-read -p "Enter target domain: " DOMAIN
+httpx -l "$OUTDIR/all_subdomains.txt" \
+    -silent -threads 100 -timeout 10 \
+    -status-code -title \
+    -o "$OUTDIR/httpx-detection.txt"
 
-echo
-echo "1) Full Recon (Everything)"
-echo "2) Provide Live Subdomains File"
-echo "3) Provide Live Subdomains + JS File"
-echo
-read -p "Choose option: " MODE
+cut -d ' ' -f1 "$OUTDIR/httpx-detection.txt" > "$OUTDIR/live_subdomains.txt"
 
-WORKDIR="$DOMAIN-recon"
-mkdir -p "$WORKDIR"
-cd "$WORKDIR"
+LIVE_COUNT=$(wc -l < "$OUTDIR/live_subdomains.txt")
+echo "[+] Live hosts: $LIVE_COUNT" | tee -a "$LOG"
 
-# =========================
-# MODE 1 — FULL RECON
-# =========================
-if [[ "$MODE" == "1" ]]; then
-  echo "[+] Running subfinder..."
-  subfinder -d "$DOMAIN" -silent -o subdomains.txt
+# ---------------- URL COLLECTION ----------------
+echo "[*] Collecting URLs..." | tee -a "$LOG"
 
-  echo "[+] Checking live subdomains..."
-  httpx -silent -l subdomains.txt > subdomains_alive.txt
+gau $DOMAIN > "$OUTDIR/gau.txt"
+waybackurls $DOMAIN > "$OUTDIR/wayback.txt"
 
-  echo "[+] Finding JS files..."
-  katana -list subdomains_alive.txt -jc -silent | grep "\.js$" | sort -u > js.txt
+cat "$OUTDIR"/gau.txt "$OUTDIR"/wayback.txt | sort -u > "$OUTDIR/all_urls.txt"
+
+URL_COUNT=$(wc -l < "$OUTDIR/all_urls.txt")
+echo "[+] Collected URLs: $URL_COUNT" | tee -a "$LOG"
+
+# ---------------- PARAMETER URLS ----------------
+echo "[*] Extracting parameter URLs..." | tee -a "$LOG"
+
+grep "=" "$OUTDIR/all_urls.txt" | sort -u > "$OUTDIR/param_urls.txt"
+PARAM_COUNT=$(wc -l < "$OUTDIR/param_urls.txt")
+echo "[+] Parameter URLs: $PARAM_COUNT" | tee -a "$LOG"
+
+# ---------------- JS FILES ----------------
+echo "[*] Extracting JavaScript files..." | tee -a "$LOG"
+
+grep "\.js" "$OUTDIR/all_urls.txt" | sort -u > "$OUTDIR/js_files.txt"
+mkdir -p "$OUTDIR/js"
+
+while read url; do
+    wget -q "$url" -P "$OUTDIR/js/" || true
+done < "$OUTDIR/js_files.txt"
+
+# ---------------- SECRET SCAN ----------------
+echo "[*] Searching for secrets in JS..." | tee -a "$LOG"
+
+grep -R -E "apikey|token|secret|password|aws|auth" "$OUTDIR/js/" > "$OUTDIR/secrets.txt" || true
+
+# ---------------- GF PATTERNS ----------------
+echo "[*] Running gf patterns..." | tee -a "$LOG"
+
+mkdir -p "$OUTDIR/gf"
+
+gf xss "$OUTDIR/param_urls.txt" > "$OUTDIR/gf/xss.txt" || true
+gf sqli "$OUTDIR/param_urls.txt" > "$OUTDIR/gf/sqli.txt" || true
+gf ssrf "$OUTDIR/param_urls.txt" > "$OUTDIR/gf/ssrf.txt" || true
+gf lfi "$OUTDIR/param_urls.txt" > "$OUTDIR/gf/lfi.txt" || true
+
+# ---------------- NUCLEI SCAN ----------------
+echo "[*] Updating nuclei templates..." | tee -a "$LOG"
+nuclei -update-templates >/dev/null 2>&1
+
+echo "[*] Preparing nuclei targets..." | tee -a "$LOG"
+cat "$OUTDIR/live_subdomains.txt" "$OUTDIR/param_urls.txt" 2>/dev/null | sort -u > "$OUTDIR/nuclei_targets.txt"
+
+TARGET_COUNT=$(wc -l < "$OUTDIR/nuclei_targets.txt")
+echo "Targets for nuclei: $TARGET_COUNT" | tee -a "$LOG"
+
+mkdir -p "$OUTDIR/nuclei"
+
+if [ "$TARGET_COUNT" -gt 0 ]; then
+    echo "[*] Running nuclei vulnerability scan..." | tee -a "$LOG"
+
+    nuclei -l "$OUTDIR/nuclei_targets.txt" \
+        -severity critical,high,medium \
+        -stats \
+        -rl 150 \
+        -c 50 \
+        -o "$OUTDIR/nuclei/results.txt"
+
+    echo "[+] Nuclei scan finished!" | tee -a "$LOG"
+else
+    echo "[!] No targets for nuclei scan." | tee -a "$LOG"
 fi
 
-# =========================
-# MODE 2 — LIVE FILE INPUT
-# =========================
-if [[ "$MODE" == "2" ]]; then
-  read -p "Path to LIVE subdomains file: " LIVEFILE
-  cp "$LIVEFILE" subdomains_alive.txt
-
-  echo "[+] Finding JS files..."
-  katana -list subdomains_alive.txt -jc -silent | grep "\.js$" | sort -u > js.txt
-fi
-
-# =========================
-# MODE 3 — LIVE + JS INPUT
-# =========================
-if [[ "$MODE" == "3" ]]; then
-  read -p "Path to LIVE subdomains file: " LIVEFILE
-  read -p "Path to JS file: " JSFILE
-  cp "$LIVEFILE" subdomains_alive.txt
-  cp "$JSFILE" js.txt
-fi
-
-echo
-echo "[+] Live subdomains:"
-wc -l subdomains_alive.txt
-echo "[+] JS files:"
-wc -l js.txt
-echo
-
-# =========================
-# URL COLLECTION (FIXED)
-# =========================
-echo "[+] Crawling URLs (katana updated flags)..."
-katana -list subdomains_alive.txt -d 5 -silent > allurls.txt
-wc -l allurls.txt
-
-# Parameters & Sensitive files
-grep "=" allurls.txt | sort -u > params.txt
-grep -E '\.txt|\.log|\.db|\.backup|\.json|\.zip|\.config' allurls.txt > sensitive_files.txt
-
-# GF patterns
-gf xss params.txt > xss_candidates.txt
-gf lfi allurls.txt > lfi_candidates.txt
-
-# =========================
-# NUCLEI
-# =========================
-echo "[+] Running nuclei..."
-nuclei -l js.txt -severity critical,high,medium -o nuclei_js.txt
-cat lfi_candidates.txt | nuclei -tags lfi -o nuclei_lfi.txt
-
-waybackurls "https://$DOMAIN" | gf xss > wayback_xss.txt
-
-echo
-echo "Recon completed!"
-echo "Results saved in $WORKDIR"
+# ---------------- DONE ----------------
+echo ""
+echo "======================================"
+echo " Recon Completed Successfully 🎯"
+echo " Output Directory: $OUTDIR"
+echo "======================================"
